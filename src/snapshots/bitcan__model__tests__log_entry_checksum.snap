@@ -1,0 +1,21 @@
+---
+source: src/model.rs
+expression: log_entry
+---
+header:
+  checksum: 1423836834
+  timestamp: 1717699061549
+  key_size: 4
+  value_size: 6
+key:
+  - 3
+  - 107
+  - 101
+  - 121
+value:
+  - 5
+  - 118
+  - 97
+  - 108
+  - 117
+  - 101

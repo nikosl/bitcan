@@ -1,0 +1,5 @@
+---
+source: tests/bitcan.rs
+expression: value
+---
+value

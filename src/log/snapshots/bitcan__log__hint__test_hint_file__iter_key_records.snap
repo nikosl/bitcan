@@ -1,0 +1,22 @@
+---
+source: src/log/hint.rs
+expression: iter_h
+---
+- - key1
+  - file_id: 01J094EV775AFXXYNTDBX6NKMK
+    entry_offset: 0
+    value_size: 123456
+    offset: 654321
+    timestamp: 1717699061549
+- - key2
+  - file_id: 01J094EV775AFXXYNTDBX6NKMK
+    entry_offset: 0
+    value_size: 123456
+    offset: 654321
+    timestamp: 1717699061549
+- - key3
+  - file_id: 01J094EV775AFXXYNTDBX6NKMK
+    entry_offset: 0
+    value_size: 123456
+    offset: 654321
+    timestamp: 1717699061549

@@ -1,5 +1,5 @@
 #![allow(dead_code, unused)]
-#![warn(clippy::pedantic)]
+#![warn(clippy::pedantic, clippy::all)]
 #![doc = include_str!("../README.md")]
 
 mod lock;
@@ -221,6 +221,12 @@ where
         hint_file.sync()?;
 
         for df in self.data_files.iter() {
+            if let Some(hint) = df.hint() {
+                let hint = hint?;
+
+                fs::remove_file(hint.path()).whatever_context("failed to remove hint file")?;
+            };
+
             fs::remove_file(df.path()).whatever_context("failed to remove file")?;
         }
 
@@ -439,11 +445,14 @@ where
         self.handle.metadata().expect("non usable record").len()
     }
 
-    pub fn keys(&mut self) -> Result<DataFileKeyIter<K, V>> {
-        self.seek_at(0).map(|_| DataFileKeyIter {
-            file: self,
-            offset: 0,
-        })
+    pub fn keys(&mut self) -> Result<impl Iterator<Item = Result<(K, KeyEntry)>> + '_> {
+        self.handle
+            .rewind()
+            .whatever_context("rewind fail")
+            .map(|()| DataFileKeyIter {
+                file: self,
+                offset: 0,
+            })
     }
 
     pub fn path(&self) -> &Path {
@@ -754,15 +763,24 @@ where
             .iter_mut()
             .map(|(_fid, df)| {
                 let mut df = df;
-                let keys = df.keys()?;
 
-                Ok(keys)
+                df.hint()
+                    .and_then(std::result::Result::ok)
+                    .map_or_else(|| Self::df_keys(df), |mut hint| Self::hint_keys(&mut hint))
+                // if let Some(hint) = df.hint() {
+                //     if let Ok(mut hint) = hint {
+                //         Self::hint_keys(&mut hint)
+                //     } else {
+                //         Self::df_keys(df)
+                //     };
+                // }
+                // Self::df_keys(df)
             })
             .collect::<Result<Vec<_>>>()?;
 
         let mut keys = HashMap::new();
         for entry in key_dir.into_iter().flatten() {
-            let (k, ke) = entry?;
+            let (k, ke) = entry;
             if ke.is_tombstone() {
                 keys.remove(&k);
             } else {
@@ -771,6 +789,14 @@ where
         }
 
         Ok(KeyDir(keys))
+    }
+
+    fn df_keys(df: &mut DataFile<K, V>) -> Result<Vec<(K, KeyEntry)>> {
+        df.keys()?.collect::<Result<Vec<_>>>()
+    }
+
+    fn hint_keys(hint: &mut HintFile<K, HintRO>) -> Result<Vec<(K, KeyEntry)>> {
+        hint.keys().collect::<Result<Vec<_>>>()
     }
 
     pub fn new(dir: impl Into<PathBuf>) -> Self {

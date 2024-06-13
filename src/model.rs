@@ -469,8 +469,6 @@ impl CodecRead for HintEntry {
             .read_exact(&mut key)
             .whatever_context("failed to read key")?;
 
-        let key = deserializer(&key).whatever_context("failed to deserialize key")?;
-
         let hintr = HintEntry {
             timestamp,
             key_size,
@@ -605,5 +603,22 @@ mod tests {
 
         let deserialized_value: String = LogEntry::deserialize(log_entry.value_bytes()).unwrap();
         assert_eq!(deserialized_value, value);
+    }
+
+    #[test]
+    fn test_hint_entry() {
+        let key = "test_key".to_string();
+        let ts = 8_123_564_987u64.into();
+
+        let hint = HintEntry::new(key, 2048, 25634, ts).unwrap();
+
+        assert_yaml_snapshot!("hint_entry_st", hint);
+
+        let bytes = hint.to_bytes();
+        let hint_frm = HintEntry::from_reader(&mut Cursor::new(&bytes))
+            .unwrap()
+            .unwrap();
+
+        assert_yaml_snapshot!("hint_entry_st", hint_frm);
     }
 }

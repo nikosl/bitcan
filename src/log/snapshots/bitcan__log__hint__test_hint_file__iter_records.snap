@@ -7,6 +7,7 @@ expression: iter_h
   value_size: 123456
   value_offset: 654321
   key:
+    - 4
     - 107
     - 101
     - 121
@@ -16,6 +17,7 @@ expression: iter_h
   value_size: 123456
   value_offset: 654321
   key:
+    - 4
     - 107
     - 101
     - 121
@@ -25,6 +27,7 @@ expression: iter_h
   value_size: 123456
   value_offset: 654321
   key:
+    - 4
     - 107
     - 101
     - 121

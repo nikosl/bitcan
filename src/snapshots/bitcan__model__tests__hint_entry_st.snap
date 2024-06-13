@@ -1,0 +1,18 @@
+---
+source: src/model.rs
+expression: hint
+---
+timestamp: 8123564987
+key_size: 9
+value_size: 2048
+value_offset: 25634
+key:
+  - 8
+  - 116
+  - 101
+  - 115
+  - 116
+  - 95
+  - 107
+  - 101
+  - 121

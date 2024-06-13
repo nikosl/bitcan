@@ -133,6 +133,15 @@ where
     }
 }
 
+impl<K, P> HintFile<K, P>
+where
+    P: HintMarker,
+{
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl<K> Read for HintFile<K, HintRO> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.handle.read(buf)
@@ -206,6 +215,38 @@ mod test_hint_file {
 
         let iter_h = hint_file
             .iter()
+            .collect::<Result<Vec<_>, Whatever>>()
+            .expect("iteration failed");
+
+        assert_yaml_snapshot!(iter_h);
+    }
+
+    #[test]
+    fn test_iter_key_records() {
+        let dir = assert_fs::TempDir::new().unwrap();
+
+        let file_id = FileId::open("01J094EV775AFXXYNTDBX6NKMK").unwrap();
+        let ts = Timestamp::from(1_717_699_061_549);
+
+        let mut hint_file: HintFile<String, HintRW> = HintFile::write(file_id, dir.path()).unwrap();
+
+        let values = vec![
+            HintEntry::new("key1".to_string(), 123_456, 654_321, ts),
+            HintEntry::new("key2".to_string(), 123_456, 654_321, ts),
+            HintEntry::new("key3".to_string(), 123_456, 654_321, ts),
+        ];
+
+        for v in &values {
+            let v = v.as_ref().unwrap();
+            hint_file.append(v).unwrap();
+        }
+
+        mem::drop(hint_file);
+
+        let mut hint_file: HintFile<String, HintRO> = HintFile::read(file_id, dir.path()).unwrap();
+
+        let iter_h = hint_file
+            .keys()
             .collect::<Result<Vec<_>, Whatever>>()
             .expect("iteration failed");
 

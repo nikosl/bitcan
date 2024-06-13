@@ -1,0 +1,9 @@
+---
+source: src/lib.rs
+expression: key_entry
+---
+file_id: file_id
+entry_offset: 0
+value_size: 18
+offset: 22
+timestamp: ts

@@ -1,11 +1,12 @@
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use snafu::Whatever;
 use ulid::Ulid;
 
-mod hint;
+pub(crate) mod hint;
 
 #[derive(Debug)]
 #[must_use]
@@ -14,7 +15,7 @@ enum FileRecords {
     DataFile(FileId),
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct FileId(Ulid);
 
 impl FileId {

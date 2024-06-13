@@ -15,7 +15,8 @@ use std::time::SystemTime;
 
 use fs4::{lock_contended_error, FileExt};
 
-use lock::DirLock;
+use lock::{DirLock, DirLockState};
+use log::hint::{HintFile, HintRO, HintRW};
 use log::FileId;
 use model::LogEntryHeader;
 use serde::de::DeserializeOwned;
@@ -31,17 +32,19 @@ const MERGE_LOCK: &str = ".bitcask.merge.lock";
 
 #[derive(Debug)]
 #[must_use]
-pub struct Bitcan<K> {
+pub struct Bitcan<K, V> {
     directory: PathBuf,
-    data_files: DataFiles,
+    data_files: DataFiles<K, V>,
     key_dir: KeyDir<K>,
     dir_lock: DirLock,
-    active_file: ActiveDataFile,
+    active_file: ActiveDataFile<K, V>,
+    rw_instance: bool,
 }
 
-impl<K> Bitcan<K>
+impl<K, V> Bitcan<K, V>
 where
     K: DeserializeOwned + Serialize + std::hash::Hash + Eq + Clone,
+    V: DeserializeOwned + Serialize,
 {
     /// Opens a Bitcan database at the specified path.
     ///
@@ -58,14 +61,15 @@ where
     /// Returns an error if the database cannot be opened.
     pub fn open(p: impl AsRef<Path>) -> Result<Self> {
         let p = p.as_ref();
-        // TODO: check locks to define the state of the database
         // TODO: recreate the key directory using hint files
 
         let dir_lock = DirLock::open(p.join(DIR_WR_LOCK))?;
+        let rw_instance = matches!(dir_lock.lock(), Ok(DirLockState::Unlocked));
 
         let mut data_files = DataFiles::open(p)?;
         let key_dir = data_files.key_dir()?;
 
+        // TODO: RO instance should not have an active file
         let (active_file, df) = ActiveDataFile::create(p)?;
         data_files.insert(df.file_id, df);
 
@@ -75,6 +79,7 @@ where
             key_dir,
             dir_lock,
             active_file,
+            rw_instance,
         })
     }
 
@@ -95,11 +100,13 @@ where
     /// # Errors
     ///
     /// Returns an error if the key-value pair cannot be inserted.
-    pub fn put<V>(&mut self, key: K, value: &V) -> Result<()>
+    pub fn put(&mut self, key: K, value: &V) -> Result<()>
     where
         K: Serialize,
         V: Serialize,
     {
+        ensure_whatever!(self.rw_instance, "read-only instance");
+
         let key_entry = self.active_file.append(&key, value)?;
         self.key_dir.insert(key, key_entry);
 
@@ -118,7 +125,7 @@ where
     ///
     /// # Example
     ///
-    pub fn get<V: DeserializeOwned>(&mut self, key: &K) -> Result<Option<V>> {
+    pub fn get(&mut self, key: &K) -> Result<Option<V>> {
         if let Some(ke) = self.key_dir.get(key) {
             let mut df = self
                 .data_files
@@ -145,6 +152,8 @@ where
     ///
     /// Returns an error if the key-value pair cannot be removed.
     pub fn remove(&mut self, key: &K) -> Result<()> {
+        ensure_whatever!(self.rw_instance, "read-only instance");
+
         if let Some(item) = self.key_dir.get(key) {
             self.active_file.tombstone(key)?;
             self.active_file.lost(u64::from(item.value_size()));
@@ -179,12 +188,20 @@ where
     ///
     /// Returns an error if the data files cannot be merged.
     pub fn merge(&mut self) -> Result<()> {
+        ensure_whatever!(self.rw_instance, "read-only instance");
+
         let lock = DirLock::open(self.path().join(MERGE_LOCK))?;
-        lock.lock()?;
+        ensure_whatever!(
+            matches!(lock.lock(), Ok(DirLockState::Unlocked)),
+            "merge lock contended"
+        );
+
+        let mut merge_keydir = KeyDir::<K>::new();
+        let mut merge_datafiles = DataFiles::new(self.path());
 
         let (mut merge_file, df) = ActiveDataFile::create(self.path())?;
-        let mut merge_keydir = KeyDir::<K>::new();
-        let mut merge_datafiles = DataFiles::new();
+        let mut hint_file: HintFile<K, HintRW> = HintFile::write(*df.file_id(), self.path())?;
+
         merge_datafiles.insert(df.file_id, df);
 
         for (k, ke) in &self.key_dir.0 {
@@ -195,11 +212,13 @@ where
 
             let le = df.get_log_entry(ke)?;
             let ke = merge_file.append_log_entry(&le, ke.timestamp())?;
+            hint_file.append_keyentry(k.clone(), &ke)?;
 
             merge_keydir.insert(k.clone(), ke);
         }
 
         merge_file.sync()?;
+        hint_file.sync()?;
 
         for df in self.data_files.iter() {
             fs::remove_file(df.path()).whatever_context("failed to remove file")?;
@@ -218,23 +237,98 @@ where
         Ok(())
     }
 
+    pub fn fold<B, F>(&mut self, init: B, mut f: F) -> B
+    where
+        V: DeserializeOwned,
+        F: FnMut(B, Result<(&K, V)>) -> B,
+    {
+        let mut b = init;
+        for (k, ke) in &self.key_dir.0 {
+            let r = self
+                .data_files
+                .get_mut(ke.file_id())
+                .whatever_context("no data file")
+                .and_then(move |df| df.get(ke))
+                .map(move |v| (k, v));
+
+            b = f(b, r);
+        }
+        b
+    }
+
     /// Returns the path to the Bitcan database.
     /// The path is a reference to the directory containing the database.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.directory
     }
+
+    /// Closes the Bitcan database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot `sync` data or
+    /// if it cannot release the directory lock.
+    pub fn close(mut self) -> Result<()> {
+        self.sync()?;
+        self.dir_lock.unlock()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.key_dir.keys()
+    }
+
+    pub fn iter(&mut self) -> impl Iterator<Item = Result<(&'_ K, V)>>
+    where
+        V: DeserializeOwned,
+    {
+        Elems {
+            bitcan: &mut self.data_files,
+            iter: self.key_dir.0.iter(),
+        }
+    }
+}
+
+impl<'b, K, V> Iterator for Elems<'b, K, V>
+where
+    K: DeserializeOwned + Serialize + std::hash::Hash + Eq + Clone,
+    V: DeserializeOwned + Serialize,
+{
+    type Item = Result<(&'b K, V)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|(k, ke)| {
+            let df = self
+                .bitcan
+                .get_mut(ke.file_id())
+                .with_whatever_context(|| "no data file")?;
+
+            let v: V = df.get(ke)?;
+
+            Ok((k, v))
+        })
+    }
+}
+
+pub struct Elems<'b, K, V> {
+    bitcan: &'b mut DataFiles<K, V>,
+    iter: std::collections::hash_map::Iter<'b, K, KeyEntry>,
 }
 
 #[derive(Debug)]
 #[must_use]
-pub(crate) struct DataFile {
+pub(crate) struct DataFile<K, V> {
     file_id: FileId,
     path: PathBuf,
     handle: File,
+    _elems: std::marker::PhantomData<(K, V)>,
 }
 
-impl DataFile {
+impl<K, V> DataFile<K, V>
+where
+    K: DeserializeOwned,
+    V: DeserializeOwned,
+{
     pub fn open(file_id: FileId, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         ensure_whatever!(path.is_dir(), "not a directory");
@@ -251,10 +345,11 @@ impl DataFile {
             file_id,
             path,
             handle,
+            _elems: std::marker::PhantomData,
         })
     }
 
-    pub fn get<V: DeserializeOwned>(&mut self, k: &KeyEntry) -> Result<V> {
+    pub fn get(&mut self, k: &KeyEntry) -> Result<V> {
         ensure_whatever!(*k.file_id() == self.file_id, "file_id mismatch");
 
         let len = k.value_size() as usize;
@@ -267,29 +362,21 @@ impl DataFile {
         Ok(v)
     }
 
-    pub fn get_key_entry<K>(&mut self, from: u64) -> Result<(K, KeyEntry)>
+    pub fn get_key_entry(&mut self, from: u64) -> Result<(K, KeyEntry)>
     where
         K: DeserializeOwned,
     {
-        self.handle
-            .seek(SeekFrom::Start(from))
-            .whatever_context("failed to seek")?;
+        self.seek_at(from)?;
 
         let header = LogEntryHeader::from_reader(&mut self.handle)?;
 
-        let key_offset = self
-            .handle
-            .stream_position()
-            .whatever_context("fail to seek")?;
+        let key_offset = self.offset()?;
 
         let key_size = header.key_size();
         let mut key = vec![0u8; key_size as usize];
         self.read_bytes(key_offset, &mut key)?;
 
-        let offset = self
-            .handle
-            .stream_position()
-            .whatever_context("fail to seek")?;
+        let offset = self.offset()?;
 
         let key = LogEntry::deserialize(&key)?;
         let key_entry = KeyEntry::new(
@@ -300,10 +387,8 @@ impl DataFile {
             header.timestamp(),
         );
 
-        let next_record = SeekFrom::Start(offset + u64::from(header.value_size()));
-        self.handle
-            .seek(next_record)
-            .whatever_context("failed to seek")?;
+        let next_record = (offset + u64::from(header.value_size()));
+        self.seek_at(next_record)?;
 
         Ok((key, key_entry))
     }
@@ -312,17 +397,13 @@ impl DataFile {
         ensure_whatever!(*k.file_id() == self.file_id, "file_id mismatch");
 
         let offset = k.start_offset();
-        self.handle
-            .seek(SeekFrom::Start(offset))
-            .whatever_context("failed to seek")?;
+        self.seek_at(offset)?;
 
         LogEntry::from_reader(&mut self.handle)
     }
 
     fn read_bytes(&mut self, from: u64, at: &mut [u8]) -> Result<()> {
-        self.handle
-            .seek(SeekFrom::Start(from))
-            .whatever_context("failed to seek")?;
+        self.seek_at(from)?;
 
         self.handle
             .read_exact(at)
@@ -331,27 +412,25 @@ impl DataFile {
         Ok(())
     }
 
-    fn read_element<K, V>(&mut self, from: u64) -> Result<Element<K, V>>
-    where
-        K: DeserializeOwned,
-        V: DeserializeOwned,
-    {
-        self.handle
-            .seek(SeekFrom::Start(from))
-            .whatever_context("failed to seek")?;
+    // fn read_element<K, V>(&mut self, from: u64) -> Result<Element<K, V>>
+    // where
+    //     K: DeserializeOwned,
+    //     V: DeserializeOwned,
+    // {
+    //     self.handle
+    //         .seek(SeekFrom::Start(from))
+    //         .whatever_context("failed to seek")?;
 
-        let le = self.read_entry(from)?;
+    //     let le = self.read_entry(from)?;
 
-        let k = le.key_deserialize()?;
-        let v = le.value_deserialize()?;
+    //     let k = le.key_deserialize()?;
+    //     let v = le.value_deserialize()?;
 
-        Ok(Element { key: k, value: v })
-    }
+    //     Ok(Element { key: k, value: v })
+    // }
 
     fn read_entry(&mut self, from: u64) -> Result<LogEntry> {
-        self.handle
-            .seek(SeekFrom::Start(from))
-            .whatever_context("failed to seek")?;
+        self.seek_at(from)?;
 
         LogEntry::from_reader(&mut self.handle)
     }
@@ -360,19 +439,11 @@ impl DataFile {
         self.handle.metadata().expect("non usable record").len()
     }
 
-    // pub fn iter(&mut self) -> impl Iterator<Item = Result<LogEntry>> {
-    //     todo!("implement iter")
-    // }
-
-    pub fn keys<K>(&mut self) -> Result<DataFileKeyIter<K>> {
-        self.handle
-            .seek(SeekFrom::Start(0))
-            .whatever_context("failed to seek")
-            .map(|_| DataFileKeyIter {
-                file: self,
-                offset: 0,
-                _phantom: std::marker::PhantomData,
-            })
+    pub fn keys(&mut self) -> Result<DataFileKeyIter<K, V>> {
+        self.seek_at(0).map(|_| DataFileKeyIter {
+            file: self,
+            offset: 0,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -382,15 +453,41 @@ impl DataFile {
     pub fn file_id(&self) -> &FileId {
         &self.file_id
     }
+
+    pub fn hint(&self) -> Option<Result<HintFile<K, HintRO>>> {
+        let parent = self.path.parent()?;
+        let hint = self.file_id.hintfile(parent);
+
+        if hint.exists() {
+            Some(HintFile::read(self.file_id, parent))
+        } else {
+            None
+        }
+    }
+
+    fn seek_at(&mut self, offset: u64) -> Result<u64> {
+        self.handle
+            .seek(SeekFrom::Start(offset))
+            .whatever_context("failed to seek")
+    }
+
+    fn offset(&mut self) -> Result<u64> {
+        self.handle
+            .stream_position()
+            .whatever_context("failed to get offset")
+    }
 }
 
-struct DataFileKeyIter<'f, K> {
-    file: &'f mut DataFile,
+struct DataFileKeyIter<'f, K, V> {
+    file: &'f mut DataFile<K, V>,
     offset: u64,
-    _phantom: std::marker::PhantomData<K>,
 }
 
-impl<'f, K: DeserializeOwned> Iterator for DataFileKeyIter<'f, K> {
+impl<'f, K, V> Iterator for DataFileKeyIter<'f, K, V>
+where
+    K: DeserializeOwned,
+    V: DeserializeOwned,
+{
     type Item = Result<(K, KeyEntry)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -399,11 +496,7 @@ impl<'f, K: DeserializeOwned> Iterator for DataFileKeyIter<'f, K> {
         }
 
         let e = self.file.get_key_entry(self.offset).and_then(|(k, ke)| {
-            let cur = self
-                .file
-                .handle
-                .stream_position()
-                .whatever_context("fail to seek")?;
+            let cur = self.file.offset()?;
 
             self.offset = cur; //+ u64::from(ke.value_size());
 
@@ -438,27 +531,28 @@ impl<'f, K: DeserializeOwned> Iterator for DataFileKeyIter<'f, K> {
 //     }
 // }
 
-impl TryFrom<ActiveDataFile> for DataFile {
-    type Error = Whatever;
+// impl<> TryFrom<ActiveDataFile> for DataFile<K, V> {
+//     type Error = Whatever;
 
-    fn try_from(value: ActiveDataFile) -> std::prelude::v1::Result<Self, Self::Error> {
-        let p = value.path.parent().expect("no parent");
+//     fn try_from(value: ActiveDataFile) -> std::prelude::v1::Result<Self, Self::Error> {
+//         let p = value.path.parent().expect("no parent");
 
-        Self::open(value.file_id, p)
-    }
-}
+//         Self::open(value.file_id, p)
+//     }
+// }
 
 #[derive(Debug)]
 #[must_use]
-pub(crate) struct ActiveDataFile {
+pub(crate) struct ActiveDataFile<K, V> {
     file_id: FileId,
     path: PathBuf,
     handle: File,
     offset: u64,
     lost_bytes: u64,
+    _elems: std::marker::PhantomData<(K, V)>,
 }
 
-impl ActiveDataFile {
+impl<K, V> ActiveDataFile<K, V> {
     fn len(&self) -> u64 {
         self.handle.metadata().unwrap().len()
     }
@@ -472,23 +566,21 @@ impl ActiveDataFile {
     }
 }
 
-impl ActiveDataFile {
-    pub fn create(p: impl AsRef<Path>) -> Result<(ActiveDataFile, DataFile)> {
+impl<K, V> ActiveDataFile<K, V>
+where
+    K: DeserializeOwned + Serialize,
+    V: DeserializeOwned + Serialize,
+{
+    pub fn create(p: impl AsRef<Path>) -> Result<(ActiveDataFile<K, V>, DataFile<K, V>)> {
         let p = p.as_ref();
 
         Self::create_datafiles(p)
     }
 
-    pub fn append<K, V>(&mut self, key: K, value: V) -> Result<KeyEntry>
-    where
-        K: Serialize,
-        V: Serialize,
-    {
+    pub fn append(&mut self, key: &K, value: &V) -> Result<KeyEntry> {
         let timestamp = Timestamp::now();
-        let entry_offset = self
-            .handle
-            .stream_position()
-            .whatever_context("failed to seek")?;
+        let entry_offset = self.offset()?;
+
         let entry = LogEntry::new(key, value, timestamp)?;
         let offset = self.append_bytes(&entry.to_bytes())?;
 
@@ -506,10 +598,10 @@ impl ActiveDataFile {
         Ok(ke)
     }
 
-    pub fn tombstone<K: Serialize>(&mut self, key: K) -> Result<u64> {
+    pub fn tombstone(&mut self, key: &K) -> Result<u64> {
         let ts = Timestamp::now();
-
         let tombstone = LogEntry::tombstone(key, ts)?.to_bytes();
+
         self.append_bytes(&tombstone)
     }
 
@@ -530,10 +622,7 @@ impl ActiveDataFile {
         le: &LogEntry,
         timestamp: Timestamp,
     ) -> Result<KeyEntry> {
-        let entry_offset = self
-            .handle
-            .stream_position()
-            .whatever_context("failed to seek")?;
+        let entry_offset = self.offset()?;
 
         let entry = le.to_bytes();
         let offset = self.append_bytes(&entry)?;
@@ -555,15 +644,12 @@ impl ActiveDataFile {
             .write_all(buf)
             .whatever_context("failed to write to file")?;
 
-        self.offset = self
-            .handle
-            .stream_position()
-            .whatever_context("failed to seek")?;
+        self.offset = self.offset()?;
 
         Ok(self.offset)
     }
 
-    fn create_datafiles(p: &Path) -> Result<(ActiveDataFile, DataFile)> {
+    fn create_datafiles(p: &Path) -> Result<(ActiveDataFile<K, V>, DataFile<K, V>)> {
         ensure_whatever!(p.is_dir(), "not a directory");
 
         let file_id = FileId::new();
@@ -591,6 +677,7 @@ impl ActiveDataFile {
             handle: write_handle,
             offset,
             lost_bytes: 0,
+            _elems: std::marker::PhantomData,
         };
 
         let rf = DataFile::open(file_id, p)?;
@@ -601,11 +688,11 @@ impl ActiveDataFile {
     fn offset(&mut self) -> Result<u64> {
         self.handle
             .stream_position()
-            .whatever_context("failed to seek")
+            .whatever_context("failed to get offset")
     }
 }
 
-impl io::Write for ActiveDataFile {
+impl<K, V> io::Write for ActiveDataFile<K, V> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.handle.write(buf)
     }
@@ -615,88 +702,20 @@ impl io::Write for ActiveDataFile {
     }
 }
 
-pub(crate) struct HintFile {
-    file_id: FileId,
-    path: PathBuf,
-    handle: File,
-    offset: u64,
-}
-
 #[derive(Debug)]
 #[must_use]
-struct DataFiles(BTreeMap<FileId, DataFile>);
+struct DataFiles<K, V>(BTreeMap<FileId, DataFile<K, V>>, PathBuf);
 
-impl DataFiles {
-    pub fn read_dir(p: impl AsRef<Path>) -> Result<Vec<(DataFile, Option<FileId>)>> {
-        let p = p.as_ref();
+impl<K, V> DataFiles<K, V>
+where
+    K: DeserializeOwned + Serialize + std::hash::Hash + Eq + Clone,
+    V: DeserializeOwned + Serialize,
+{
+    pub fn open(p: impl Into<PathBuf>) -> Result<Self> {
+        let p = p.into();
         ensure_whatever!(p.is_dir(), "not a directory");
 
-        let dir = fs::read_dir(p).with_whatever_context(|e| format!("failed to read dir: {e}"))?;
-        let dir = {
-            let mut files = dir
-                .map(|e| {
-                    e.map(|e| e.path())
-                        .with_whatever_context(|e| format!("failed to read entry: {e}"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            files.sort();
-
-            files
-        };
-
-        let (df, hf): (Vec<_>, Vec<_>) = dir
-            .iter()
-            .filter(|p| p.is_file())
-            .filter_map(|p| {
-                let ext = p.extension().and_then(|e| e.to_str())?;
-                let name = p.file_stem().and_then(|e| e.to_str())?;
-
-                Some((name, ext))
-            })
-            .filter(|(_name, ext)| matches!(*ext, "data" | "hint"))
-            .map(|(name, ext)| (name.to_string(), ext))
-            .partition(|(_name, ext)| *ext == "data");
-
-        let mut hf = hf.iter().peekable();
-        let dir = df
-            .iter()
-            .map(move |(name, _ext)| {
-                let h = hf.peek();
-                if let Some(h) = h {
-                    if h.0 == *name {
-                        return (name.to_string(), hf.next().map(|(n, _)| n.to_string()));
-                    }
-                }
-
-                (name.to_string(), None)
-            })
-            .collect::<Vec<_>>();
-
-        let dir = dir
-            .iter()
-            .map(|(d, h)| {
-                let d = FileId::open(d)?;
-                let h = h.as_ref().and_then(|h| FileId::open(h).ok());
-
-                Ok((d, h))
-            })
-            .map(|f| {
-                let (d, h) = f?;
-                let d = DataFile::open(d, p)?;
-
-                Ok((d, h))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(dir)
-    }
-
-    pub fn open(p: impl AsRef<Path>) -> Result<Self> {
-        let p = p.as_ref();
-        ensure_whatever!(p.is_dir(), "not a directory");
-
-        let dir = fs::read_dir(p).with_whatever_context(|e| format!("failed to read dir: {e}"))?;
+        let dir = fs::read_dir(&p).with_whatever_context(|e| format!("failed to read dir: {e}"))?;
         let dir = dir
             .map(|e| {
                 e.map(|e| e.path())
@@ -717,16 +736,16 @@ impl DataFiles {
             .map(FileId::open)
             .map(|fid| {
                 let fid = fid?;
-                let df = DataFile::open(fid, p)?;
+                let df = DataFile::open(fid, &p)?;
 
                 Ok((fid, df))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
 
-        Ok(Self(data_files))
+        Ok(Self(data_files, p))
     }
 
-    pub fn key_dir<K>(&mut self) -> Result<KeyDir<K>>
+    pub fn key_dir(&mut self) -> Result<KeyDir<K>>
     where
         K: DeserializeOwned + Serialize + std::hash::Hash + Eq + Clone,
     {
@@ -735,7 +754,7 @@ impl DataFiles {
             .iter_mut()
             .map(|(_fid, df)| {
                 let mut df = df;
-                let keys = df.keys::<K>()?;
+                let keys = df.keys()?;
 
                 Ok(keys)
             })
@@ -754,19 +773,19 @@ impl DataFiles {
         Ok(KeyDir(keys))
     }
 
-    pub fn new() -> Self {
-        DataFiles(BTreeMap::new())
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        DataFiles(BTreeMap::new(), dir.into())
     }
 
-    pub(crate) fn get(&self, file_id: &FileId) -> Option<&DataFile> {
+    pub(crate) fn get(&self, file_id: &FileId) -> Option<&DataFile<K, V>> {
         self.0.get(file_id)
     }
 
-    pub(crate) fn get_mut(&mut self, file_id: &FileId) -> Option<&mut DataFile> {
+    pub(crate) fn get_mut(&mut self, file_id: &FileId) -> Option<&mut DataFile<K, V>> {
         self.0.get_mut(file_id)
     }
 
-    pub(crate) fn insert(&mut self, file_id: FileId, df: DataFile) {
+    pub(crate) fn insert(&mut self, file_id: FileId, df: DataFile<K, V>) {
         self.0.insert(file_id, df);
     }
 
@@ -778,7 +797,7 @@ impl DataFiles {
         self.0.clear();
     }
 
-    pub(crate) fn iter(&mut self) -> impl Iterator<Item = &DataFile> {
+    pub(crate) fn iter(&mut self) -> impl Iterator<Item = &DataFile<K, V>> {
         self.0.values()
     }
 }
@@ -806,6 +825,14 @@ where
     fn get(&self, key: &K) -> Option<&KeyEntry> {
         self.0.get(key)
     }
+
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.0.keys()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 impl<K> FromIterator<(K, KeyEntry)> for KeyDir<K>
@@ -817,16 +844,19 @@ where
     }
 }
 
-struct Element<K, V> {
-    key: K,
+struct Element<'b, K, V> {
+    key: &'b K,
     value: V,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::u8;
+
     use super::*;
     use assert_fs::prelude::*;
     use bincode::Options;
+    use insta::assert_yaml_snapshot;
     use predicates::prelude::*;
     use serde_binary::binary_stream::Endian;
     use serde_json::Value;
@@ -834,7 +864,7 @@ mod tests {
     #[test]
     fn test_datafile_create() -> Result<()> {
         let datadir = assert_fs::TempDir::new().unwrap();
-        let (active, _) = ActiveDataFile::create(&datadir)?;
+        let (active, _): (ActiveDataFile<u16, u16>, _) = ActiveDataFile::create(&datadir)?;
 
         datadir
             .child(format!("{}.data", active.file_id).as_str())
@@ -875,30 +905,29 @@ mod tests {
     #[test]
     fn test_datafile_append_read() -> Result<()> {
         let datadir = assert_fs::TempDir::new().unwrap().into_persistent_if(false);
-        let (mut active, _) = ActiveDataFile::create(&datadir)?;
+        let (mut active, mut df) = ActiveDataFile::create(&datadir)?;
 
-        let key = b"key";
-        let value = b"value";
+        let key = "key".to_owned();
+        let value = "value".to_owned();
 
-        let keya = b"keyabcdef";
-        let valuea = b"value_abcdef";
+        let keya = "keyabcdef".to_owned();
+        let valuea = "value_abcdef".to_owned();
 
-        let key_entry = active.append(key, value).unwrap();
-        let key_entry_a = active.append(keya, valuea).unwrap();
+        let key_entry = active.append(&key, &value).unwrap();
+        let key_entry_a = active.append(&keya, &valuea).unwrap();
 
-        assert_eq!(*key_entry.file_id(), *key_entry_a.file_id(), "file_id");
+        let fid = df.file_id().to_string();
+        assert_yaml_snapshot!(key_entry, { ".file_id" =>insta::dynamic_redaction(move |val, _| {
+            assert_eq!(val.as_str().unwrap(), fid);
+            "file_id"
+        }), 
+    ".timestamp" =>"ts" });
 
-        let df = datadir
-            .child(format!("{}.data", active.file_id).as_str())
-            .to_path_buf();
+        let vbuff = df.get(&key_entry)?;
+        assert_yaml_snapshot!(vbuff);
 
-        let vbuff = read_entry(&df, key_entry.offset(), key_entry.value_size());
-
-        assert_eq!(vbuff, value);
-
-        let vbuff = read_entry(&df, key_entry_a.offset(), key_entry_a.value_size());
-
-        assert_eq!(vbuff, valuea);
+        let vbuff = df.get(&key_entry_a)?;
+        assert_yaml_snapshot!(vbuff);
 
         Ok(())
     }
@@ -910,22 +939,23 @@ mod tests {
             key: u32,
             data: u32,
         }
+
         let datadir = assert_fs::TempDir::new().unwrap().into_persistent_if(false);
-        println!("datadir: {datadir:?}");
+
         let (mut active, mut ro) = ActiveDataFile::create(&datadir)?;
 
         let key = KeyStruct::default(); //serde_json::json!({"key": "value"}).to_string();
         let value = serde_json::json!({"value": "value"}).to_string();
 
-        let _entry = active.append(key, &value).unwrap();
-        let key_entry = active.append(key, &value).unwrap();
-        let _entry = active.append(key, &value).unwrap();
+        let _entry = active.append(&key, &value).unwrap();
+        let key_entry = active.append(&key, &value).unwrap();
         let v: String = ro.get(&key_entry)?;
 
         assert_eq!(v, value);
 
         Ok(())
     }
+
     #[test]
     fn test_datafile_append_get() -> Result<()> {
         #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -934,44 +964,17 @@ mod tests {
             data: u32,
         }
         let datadir = assert_fs::TempDir::new().unwrap().into_persistent_if(false);
-        println!("datadir: {datadir:?}");
         let (mut active, mut ro) = ActiveDataFile::create(&datadir)?;
 
         let key = KeyStruct::default(); //serde_json::json!({"key": "value"}).to_string();
         let value = serde_json::json!({"value": "value"}).to_string();
 
-        let key_entry = active.append(key, &value).unwrap();
+        let key_entry = active.append(&key, &value).unwrap();
         let v: String = ro.get(&key_entry)?;
 
         assert_eq!(v, value);
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_datafile_get_elem() -> Result<()> {
-        #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        struct KeyStruct {
-            key: u32,
-            data: u32,
-        }
-
-        let datadir = assert_fs::TempDir::new().unwrap().into_persistent_if(false);
-        println!("datadir: {datadir:?}");
-        let (mut active, mut ro) = ActiveDataFile::create(&datadir)?;
-
-        // let key = serde_json::json!({"key": "value"}).to_string();
-        let key = KeyStruct::default(); //serde_json::json!({"key": "value"}).to_string();
-        let value = serde_json::json!({"value": "value"}).to_string();
-
-        let key_entry = active.append(key, &value).unwrap();
-        let e: Element<KeyStruct, String> = ro.read_element(0)?;
-
-        let k = e.key;
-        let v = e.value;
-
-        assert_eq!(k, key, "key");
-        assert_eq!(v, value, "value");
+        assert_yaml_snapshot!(key_entry, { ".file_id" => "file_id", ".timestamp" =>"ts" });
 
         Ok(())
     }
@@ -985,17 +988,35 @@ mod tests {
 
         let mut expected = Vec::with_capacity(entries.len());
         for (k, v) in entries {
-            let key_entry = active.append(k.to_owned(), v.to_owned())?;
+            let key_entry = active.append(&k.to_owned(), &v.to_owned())?;
             expected.push((k, key_entry));
         }
 
-        let keys = ro.keys::<String>()?;
+        let keys = ro.keys()?;
         keys.zip(expected.iter()).for_each(|(k, (ek, ev))| {
             let (k, ke) = k.expect("failed to get key entry");
 
             assert_eq!(k, *ek, "key");
             assert_eq!(ke, *ev, "value");
         });
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_hintfile_exist() -> Result<()> {
+        let dir = assert_fs::TempDir::new().unwrap().into_persistent_if(false);
+
+        let file_id = FileId::new();
+
+        File::create(file_id.datafile(&dir)).expect("failed to create datafile");
+        let df: DataFile<u128, u128> = DataFile::open(file_id, &dir)?;
+
+        assert!(df.hint().is_none(), "hint file should not exist");
+
+        File::create(file_id.hintfile(&dir)).expect("failed to create hint file");
+
+        assert!(df.hint().is_some(), "hint file should exist");
 
         Ok(())
     }

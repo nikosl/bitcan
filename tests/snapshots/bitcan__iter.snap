@@ -1,0 +1,10 @@
+---
+source: tests/bitcan.rs
+expression: col
+---
+- - key
+  - avalue
+- - key2
+  - avalue
+- - key3
+  - avalue

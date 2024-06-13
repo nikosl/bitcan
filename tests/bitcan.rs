@@ -12,7 +12,7 @@ fn test_put() {
     let key = "key".to_string();
     let value = "value".to_string();
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
 
     bitcan.put(key.clone(), &value).unwrap();
     let value: Option<String> = bitcan.get(&key).unwrap();
@@ -27,14 +27,14 @@ fn test_put_persist() {
     let key = "key".to_string();
     let value = "value".to_string();
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
 
     bitcan.put(key.clone(), &value).unwrap();
     let _value: Option<String> = bitcan.get(&key).unwrap();
 
     mem::drop(bitcan);
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     let value: Option<String> = bitcan.get(&key).unwrap();
 
     assert_yaml_snapshot!(value)
@@ -47,7 +47,7 @@ fn test_rm_persist() {
     let key = "key".to_string();
     let value = "value".to_string();
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
 
     bitcan.put(key.clone(), &value).unwrap();
     let _value: Option<String> = bitcan.get(&key).unwrap();
@@ -55,7 +55,7 @@ fn test_rm_persist() {
 
     mem::drop(bitcan);
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     let value: Option<String> = bitcan.get(&key).unwrap();
 
     assert_yaml_snapshot!(value)
@@ -68,38 +68,42 @@ fn test_merge_persist() -> Result<()> {
     let key = "key".to_string();
     let value = "value".to_string();
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     bitcan.put(key.clone(), &value).unwrap();
 
     mem::drop(bitcan);
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     let value: Option<String> = bitcan.get(&key).unwrap();
 
     assert_yaml_snapshot!(value);
 
+    mem::drop(bitcan);
+
     let key2 = "key2".to_string();
     let value2 = "value".to_string();
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     bitcan.put(key2.clone(), &value2).unwrap();
 
     mem::drop(bitcan);
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     let value2: Option<String> = bitcan.get(&key2).unwrap();
 
     assert_yaml_snapshot!(value2);
 
+    mem::drop(bitcan);
+
     let key3 = "key2".to_string();
     let value3 = "value".to_string();
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     bitcan.put(key3.clone(), &value3).unwrap();
 
     mem::drop(bitcan);
 
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
     let value3: Option<String> = bitcan.get(&key3).unwrap();
 
     assert_yaml_snapshot!(value3);
@@ -110,7 +114,7 @@ fn test_merge_persist() -> Result<()> {
     mem::drop(bitcan);
 
     let post_merge = lsdir(dir.path())?;
-    let mut bitcan: Bitcan<String> = Bitcan::open(dir.path()).unwrap();
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
 
     for f in pre_merge {
         if let Some(f) = post_merge.iter().find(|&x| x == &f) {
@@ -124,6 +128,40 @@ fn test_merge_persist() -> Result<()> {
     assert_yaml_snapshot!(value2);
     let value3: Option<String> = bitcan.get(&key3).unwrap();
     assert_yaml_snapshot!(value3);
+
+    Ok(())
+}
+
+#[test]
+fn test_iter() -> Result<()> {
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    let key = "key".to_string();
+    let value = "value".to_string();
+
+    let mut bitcan: Bitcan<String, String> = Bitcan::open(dir.path()).unwrap();
+    bitcan.put(key.clone(), &value).unwrap();
+
+    let key2 = "key2".to_string();
+    let value2 = "value".to_string();
+
+    bitcan.put(key2.clone(), &value2).unwrap();
+
+    let key3 = "key3".to_string();
+    let value3 = "value".to_string();
+
+    bitcan.put(key3.clone(), &value3).unwrap();
+
+    let mut col = bitcan
+        .iter()
+        .map(|r| {
+            let (k, v) = r.unwrap();
+            (k, format!("a{v}"))
+        })
+        .collect::<Vec<_>>();
+    col.sort_by(|a, b| a.0.cmp(b.0));
+
+    assert_yaml_snapshot!(col);
 
     Ok(())
 }

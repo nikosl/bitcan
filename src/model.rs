@@ -2,12 +2,13 @@ use std::io::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::Options as _;
-use byteorder::ReadBytesExt as _;
+use byteorder::{ReadBytesExt as _, WriteBytesExt, BE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::ensure_whatever;
 use snafu::{ResultExt, Whatever};
 
+use crate::log::hint::HintFile;
 use crate::log::FileId;
 
 const CHECKSUM_SIZE: usize = std::mem::size_of::<u32>();
@@ -16,7 +17,7 @@ const KEY_SIZE_SIZE: usize = std::mem::size_of::<u32>();
 const VALUE_SIZE_SIZE: usize = std::mem::size_of::<u32>();
 const OFFSET_SIZE: usize = std::mem::size_of::<u64>();
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[must_use]
 pub struct KeyEntry {
     file_id: FileId,
@@ -358,7 +359,12 @@ impl Ord for LogEntry {
     }
 }
 
+pub(crate) const HINT_HEADER_SIZE: usize =
+    TIMESTAMP_SIZE + KEY_SIZE_SIZE + VALUE_SIZE_SIZE + OFFSET_SIZE;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct HintEntry {
+    // file_id: FileId,
     timestamp: Timestamp,
     key_size: u32,
     value_size: u32,
@@ -367,10 +373,127 @@ pub(crate) struct HintEntry {
 }
 
 impl HintEntry {
-    pub const HINT_HEADER_SIZE: usize =
-        TIMESTAMP_SIZE + KEY_SIZE_SIZE + VALUE_SIZE_SIZE + OFFSET_SIZE;
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn new<K>(
+        // file_id: FileId,
+        key: K,
+        value_size: u32,
+        value_offset: u64,
+        timestamp: Timestamp,
+    ) -> Result<HintEntry, Whatever>
+    where
+        K: Serialize,
+    {
+        let key = serializer(key)?;
+        let key_size = key.len() as u32;
+
+        Ok(HintEntry {
+            // file_id,
+            timestamp,
+            key_size,
+            value_size,
+            value_offset,
+            key,
+        })
+    }
+
+    pub fn key<K: DeserializeOwned>(&self) -> Result<K, Whatever> {
+        deserializer(&self.key)
+    }
+
+    pub fn key_size(&self) -> u32 {
+        self.key_size
+    }
+
+    pub fn value_size(&self) -> u32 {
+        self.value_size
+    }
+
+    pub fn value_offset(&self) -> u64 {
+        self.value_offset
+    }
+
+    pub fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn to_bytes(&self) -> std::vec::Vec<u8> {
+        let mut data = Vec::with_capacity(HINT_HEADER_SIZE + self.key.len());
+
+        data.write_u64::<BE>(self.timestamp.into());
+        data.write_u32::<BE>(self.key_size);
+        data.write_u32::<BE>(self.value_size);
+        data.write_u64::<BE>(self.value_offset);
+        data.write_all(&self.key);
+
+        data
+    }
 }
 
+impl CodecRead for HintEntry {
+    type Error = Whatever;
+    type Output = Option<Self>;
+
+    fn from_reader<R>(reader: &mut R) -> Result<Self::Output, Self::Error>
+    where
+        R: Read,
+    {
+        let mut buf = [0u8; HINT_HEADER_SIZE];
+        if let Err(e) = reader.read_exact(&mut buf) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
+            }
+
+            return Err(e).whatever_context("failed to read header");
+        };
+
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let timestamp = cursor
+            .read_u64::<BE>()
+            .whatever_context("failed to read timestamp")?
+            .into();
+        let key_size = cursor
+            .read_u32::<BE>()
+            .whatever_context("failed to read key size")?;
+        let value_size = cursor
+            .read_u32::<BE>()
+            .whatever_context("failed to read value size")?;
+        let value_offset = cursor
+            .read_u64::<BE>()
+            .whatever_context("failed to read value size")?;
+
+        let mut key = vec![0u8; key_size as usize];
+        reader
+            .read_exact(&mut key)
+            .whatever_context("failed to read key")?;
+
+        let key = deserializer(&key).whatever_context("failed to deserialize key")?;
+
+        let hintr = HintEntry {
+            timestamp,
+            key_size,
+            value_size,
+            value_offset,
+            key,
+        };
+
+        Ok(Some(hintr))
+    }
+}
+
+// impl<K> From<HintEntry<K>> for KeyEntry {
+//     fn from(item: HintEntry<K>) -> Self {
+//         KeyEntry {
+//             file_id: item.file_id,
+//             entry_offset: 0,
+//             value_size: item.value_size,
+//             offset: item.value_offset,
+//             timestamp: item.timestamp,
+//         }
+//     }
+// }
 impl PartialOrd for LogEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -390,6 +513,19 @@ fn deserializer<'de, T: serde::Deserialize<'de>>(data: &'de [u8]) -> Result<T, W
         .with_big_endian()
         .deserialize(data)
         .whatever_context("failed to deserialize data []")
+}
+
+pub(crate) trait CodecRead {
+    type Error;
+    type Output;
+
+    fn from_reader<R: Read>(reader: &mut R) -> Result<Self::Output, Self::Error>;
+}
+
+pub(crate) trait CodecWrite {
+    type Error;
+
+    fn to_bytes(&self) -> Result<Vec<u8>, Self::Error>;
 }
 
 #[cfg(test)]

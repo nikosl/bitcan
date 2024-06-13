@@ -20,7 +20,6 @@ pub(crate) enum DirLockState {
 pub(crate) struct DirLock(File, PathBuf);
 
 impl DirLock {
-
     pub fn lock(&self) -> Result<DirLockState> {
         match self.0.try_lock_exclusive() {
             Ok(()) => Ok(DirLockState::Unlocked),
@@ -64,5 +63,48 @@ impl Drop for DirLock {
     fn drop(&mut self) {
         let _lock = self.unlock();
         let _close = fs::remove_file(&self.1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem;
+
+    use super::*;
+
+    #[test]
+    fn test_lock_unlock() {
+        let lockf = assert_fs::NamedTempFile::new("lock_file").unwrap();
+        let lock_file_path = lockf.path();
+
+        let dir_lock = DirLock::open(lock_file_path).unwrap();
+
+        // Ensure the initial state is unlocked
+        assert_eq!(dir_lock.lock().unwrap(), DirLockState::Unlocked);
+
+        // Lock the directory
+        assert_eq!(dir_lock.lock().unwrap(), DirLockState::Locked);
+
+        // Unlock the directory
+        assert!(dir_lock.unlock().is_ok());
+
+        // Ensure the directory is unlocked after unlocking
+        assert_eq!(dir_lock.lock().unwrap(), DirLockState::Unlocked);
+    }
+
+    #[test]
+    fn test_lock_cleanup() {
+        let lockf = assert_fs::NamedTempFile::new("lock_file").unwrap();
+        let lock_file_path = lockf.path();
+
+        let dir_lock = DirLock::open(lock_file_path).unwrap();
+        dir_lock.lock().unwrap();
+
+        mem::drop(dir_lock);
+
+        assert!(
+            !lock_file_path.exists(),
+            "lock file should not exist after drop"
+        );
     }
 }
